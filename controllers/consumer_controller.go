@@ -19,13 +19,15 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"github.com/lwolf/konsumerator/pkg/predictors"
 	"strconv"
+	"time"
 
 	"github.com/go-logr/logr"
 	"github.com/mitchellh/hashstructure"
 	appsv1 "k8s.io/api/apps/v1"
 	v1 "k8s.io/api/apps/v1"
-	v12 "k8s.io/api/core/v1"
+	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	ctrl "sigs.k8s.io/controller-runtime"
@@ -43,6 +45,7 @@ var (
 	deploymentGeneration        = "konsumerator.lwolf.org/deployment-generation"
 	deployOwnerKey              = ".metadata.controller"
 	defaultPartitionEnvKey      = "KONSUMERATOR_PARTITION"
+	defaultMinSyncPeriod        = time.Minute
 	apiGVStr                    = konsumeratorv1alpha1.GroupVersion.String()
 )
 
@@ -82,9 +85,18 @@ type ConsumerReconciler struct {
 // +kubebuilder:rbac:groups=apps,resources=deployments,verbs=get;update;patch;delete;list
 // +kubebuilder:rbac:groups=apps,resources=deployments/status,verbs=get
 
+type Worker struct {
+	Id         int32
+	IsMissing  bool
+	Lag        time.Duration
+	IsOutdated bool
+	Deployment *appsv1.Deployment
+}
+
 func (r *ConsumerReconciler) Reconcile(req ctrl.Request) (ctrl.Result, error) {
 	ctx := context.Background()
 	log := r.Log.WithValues("consumer", req.NamespacedName)
+	result := ctrl.Result{RequeueAfter: defaultMinSyncPeriod}
 
 	var consumer konsumeratorv1alpha1.Consumer
 	if err := r.Get(ctx, req.NamespacedName, &consumer); err != nil {
@@ -98,12 +110,23 @@ func (r *ConsumerReconciler) Reconcile(req ctrl.Request) (ctrl.Result, error) {
 		log.Error(err, "unable to list managed deployments")
 		return ctrl.Result{}, err
 	}
+	autoscalerDisabled := len(consumer.Annotations[disableAutoscalerAnnotation]) > 0
+	if !autoscalerDisabled && consumer.Spec.Autoscaler != nil {
+		switch consumer.Spec.Autoscaler.Mode {
+		case konsumeratorv1alpha1.AutoscalerTypePrometheus:
+			// query prometheus for the metrics
+		case konsumeratorv1alpha1.AutoscalerTypeVpa:
+			// create VPA object for each deployment
+		default:
+
+		}
+	}
 
 	var err error
 	var lagProvider providers.LagSource
+	// var predictedResources map[int32]corev1.ResourceRequirements
 	lagProvider = providers.NewLagSourceDummy(*consumer.Spec.NumPartitions)
 	// set lagProvider to dummy if disable-autoscaler-annotation is set
-	autoscalerDisabled := len(consumer.Annotations[disableAutoscalerAnnotation]) > 0
 	if !autoscalerDisabled && consumer.Spec.Autoscaler.Mode == konsumeratorv1alpha1.AutoscalerTypePrometheus {
 		lagProvider, err = providers.NewLagSourcePrometheus(consumer.Spec.Autoscaler.Prometheus)
 		if err != nil {
@@ -114,6 +137,11 @@ func (r *ConsumerReconciler) Reconcile(req ctrl.Request) (ctrl.Result, error) {
 			if err := lagProvider.EstimateLag(); err != nil {
 				log.Error(err, "failed to query lag provider")
 			}
+			// rate, err := lagProvider.QueryProductionRateDistribution() {
+			//
+			// }
+			// policy := consumer.Spec.ResourcePolicy.ContainerPolicies[0]
+			// predictedResources = predictors.AssignResourcesBasedOnProductionRate(policy, lagProvider.)
 			lagLst, err := json.Marshal(lagProvider.GetLag())
 			if err != nil {
 				log.Error(err, "failed to serialize lag data")
@@ -137,31 +165,38 @@ func (r *ConsumerReconciler) Reconcile(req ctrl.Request) (ctrl.Result, error) {
 	}
 	consumer.Status.ObservedGeneration = helpers.Ptr2Int64(int64(hash))
 
-	parts := make(map[int32]bool)
+	partitions := make(map[int32]Worker)
 	for i := range managedDeploys.Items {
-		deploy := managedDeploys.Items[i]
+		deploy := managedDeploys.Items[i].DeepCopy()
 		var isRedundant bool
 		partition := helpers.ParsePartitionAnnotation(deploy.Annotations[managedPartitionAnnotation])
 		if partition == nil {
-			log.Error(nil, "failed to parse annotation with partition number. Panic!!!")
+			log.Info("failed to parse annotation with partition number. Deleting.", "deployment", deploy.Name)
+			redundantInstances = append(redundantInstances, deploy)
 			continue
 		}
-		parts[*partition] = true
+		w := Worker{
+			Id:         *partition,
+			Deployment: deploy,
+		}
 		lag := lagProvider.GetLagByPartition(*partition)
-		runningInstances = append(runningInstances, &deploy)
+		runningInstances = append(runningInstances, deploy)
 		if consumer.Spec.Autoscaler.Prometheus.TolerableLag != nil && lag >= consumer.Spec.Autoscaler.Prometheus.TolerableLag.Duration {
-			laggingInstances = append(laggingInstances, &deploy)
+			laggingInstances = append(laggingInstances, deploy)
+			w.Lag = lag
 		}
 		if *partition > *consumer.Spec.NumPartitions {
 			isRedundant = true
-			redundantInstances = append(redundantInstances, &deploy)
+			redundantInstances = append(redundantInstances, deploy)
 		}
 		if !isRedundant && deploy.Annotations[deploymentGeneration] != strconv.Itoa(int(*consumer.Status.ObservedGeneration)) {
-			outdatedInstances = append(outdatedInstances, &deploy)
+			outdatedInstances = append(outdatedInstances, deploy)
+			w.IsOutdated = true
 		}
+		partitions[*partition] = w
 	}
 	for i := int32(0); i < *consumer.Spec.NumPartitions; i++ {
-		if _, ok := parts[i]; !ok {
+		if _, ok := partitions[i]; !ok {
 			missingPartitions = append(missingPartitions, i)
 		}
 	}
@@ -186,7 +221,7 @@ func (r *ConsumerReconciler) Reconcile(req ctrl.Request) (ctrl.Result, error) {
 
 	if err := r.Status().Update(ctx, &consumer); errors.IgnoreConflict(err) != nil {
 		log.Error(err, "unable to update Consumer status")
-		return ctrl.Result{}, err
+		return result, err
 	}
 
 	for _, mp := range missingPartitions {
@@ -224,7 +259,7 @@ func (r *ConsumerReconciler) Reconcile(req ctrl.Request) (ctrl.Result, error) {
 			continue
 		}
 		for containerIndex := range deploy.Spec.Template.Spec.Containers {
-			envs := setEnvVariable(deploy.Spec.Template.Spec.Containers[containerIndex].Env, partitionKey, strconv.Itoa(int(*partition)))
+			envs := helpers.SetEnvVariable(deploy.Spec.Template.Spec.Containers[containerIndex].Env, partitionKey, strconv.Itoa(int(*partition)))
 			deploy.Spec.Template.Spec.Containers[containerIndex].Env = envs
 		}
 		if err := r.Update(ctx, deploy); errors.IgnoreConflict(err) != nil {
@@ -232,21 +267,7 @@ func (r *ConsumerReconciler) Reconcile(req ctrl.Request) (ctrl.Result, error) {
 			continue
 		}
 	}
-	return ctrl.Result{}, nil
-}
-
-func setEnvVariable(envVars []v12.EnvVar, key string, value string) []v12.EnvVar {
-	for i, e := range envVars {
-		if e.Name == key {
-			envVars[i].Value = value
-			return envVars
-		}
-	}
-	envVars = append(envVars, v12.EnvVar{
-		Name:  key,
-		Value: value,
-	})
-	return envVars
+	return result, nil
 }
 
 func (r *ConsumerReconciler) constructDeployment(consumer konsumeratorv1alpha1.Consumer, p int32) (*appsv1.Deployment, error) {
@@ -272,7 +293,7 @@ func (r *ConsumerReconciler) constructDeployment(consumer konsumeratorv1alpha1.C
 	}
 	for i, _ := range deploy.Spec.Template.Spec.Containers {
 		name := deploy.Spec.Template.Spec.Containers[i].Name
-		envs := setEnvVariable(deploy.Spec.Template.Spec.Containers[i].Env, partitionKey, strconv.Itoa(int(p)))
+		envs := helpers.SetEnvVariable(deploy.Spec.Template.Spec.Containers[i].Env, partitionKey, strconv.Itoa(int(p)))
 		deploy.Spec.Template.Spec.Containers[i].Env = envs
 		for _, cp := range consumer.Spec.ResourcePolicy.ContainerPolicies {
 			if cp.ContainerName == name {

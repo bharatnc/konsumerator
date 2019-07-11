@@ -78,7 +78,7 @@ var _ = Describe("Consumer", func() {
 									{Name: "pod", Image: "busybox"},
 								},
 							}},
-					}, // spec.deploymentTemplate.template.metadata.creationTimestamp
+					},
 					ResourcePolicy: &autoscalev1.PodResourcePolicy{},
 				},
 			}

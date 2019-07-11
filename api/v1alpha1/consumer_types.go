@@ -39,7 +39,7 @@ type ConsumerSpec struct {
 	Name          string `json:"name"`          // Name of the deployments to run
 	Namespace     string `json:"namespace"`     // Namespace to run managed deployments
 	// +optional
-	Autoscaler AutoscalerSpec `json:"autoscaler,omitempty"`
+	Autoscaler *AutoscalerSpec `json:"autoscaler,omitempty"`
 
 	// +optional
 	PartitionEnvKey    string                         `json:"partitionEnvKey,omitempty"`
@@ -72,9 +72,7 @@ type OffsetQuerySpec struct {
 }
 
 type ProductionQuerySpec struct {
-	Query string `json:"query"`
-	// container_cpu_user_seconds_total{namespace="monitoring"}
-	MetricName     string `json:"metricName"`
+	Query          string `json:"query"`
 	PartitionLabel string `json:"partitionLabel"`
 }
 

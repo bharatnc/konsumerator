@@ -5,7 +5,7 @@ import (
 )
 
 type DummyLagSource struct {
-	lag        map[int32]float64
+	lag        map[int32]int64
 	partitions int32
 }
 
@@ -16,27 +16,27 @@ func (l *DummyLagSource) GetLagByPartition(partition int32) time.Duration {
 	return time.Duration(l.lag[partition]) * time.Second
 }
 
-func (l *DummyLagSource) QueryConsumptionRate() (map[int32]float64, error) {
+func (l *DummyLagSource) QueryConsumptionRate() (map[int32]int64, error) {
 	return nil, nil
 }
 
-func (l *DummyLagSource) QueryProductionRate() (map[int32]float64, error) {
+func (l *DummyLagSource) QueryProductionRate() (map[int32]int64, error) {
 	return nil, nil
 }
 
-func (l *DummyLagSource) QueryOffset() (map[int32]float64, error) {
+func (l *DummyLagSource) QueryOffset() (map[int32]int64, error) {
 	return nil, nil
 }
 func (l *DummyLagSource) EstimateLag() error {
 	return nil
 }
-func (l *DummyLagSource) GetLag() map[int32]float64 {
+func (l *DummyLagSource) GetLag() map[int32]int64 {
 	return nil
 }
 
-func (l *DummyLagSource) QueryProductionRateDistribution() (map[int32]float64, error) {
+func (l *DummyLagSource) QueryProductionRateDistribution() (map[int32]int64, error) {
 	for i := 0; i < int(l.partitions); i++ {
-		l.lag[int32(i)] = float64(0)
+		l.lag[int32(i)] = int64(0)
 	}
 	return l.lag, nil
 }
