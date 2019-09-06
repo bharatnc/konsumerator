@@ -20,18 +20,22 @@ v0.3
 
 v0.4
 * [ ] Validate/Fix RBAC permissions
+* [x] build simple service to produce pseudo-data to local kafka/prometheus
+
+v0.5 scaling
 * [ ] Scale down only when no lag present
 * [ ] Scale down after X periods of no lag
 * [ ] Try replacing Deployment with ReplicaSet for simplicity 
-* [x] build simple service to produce pseudo-data to local kafka/prometheus
+* [ ] Consider getting all the pods to estimate uptime/last scale event
+* [ ] Store last X metrics in the consumer status
 
-v0.5  - observability
+v0.6  - observability
 * [x] Post behaviour updates to Kubernetes events
 * [ ] Cleanup logging
 * [ ] Expose metrics about own health and behaviour
 * [ ] Grafana dashboard
 
-v0.6
+v0.7
 * [ ] Verify that HA mode works
 * [ ] Recreate deployments from scratch, if any of the immutable fields were changed in the deploymentSpec
       Now, it requires manual deleting of all deployments.

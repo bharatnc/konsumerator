@@ -44,8 +44,8 @@ import (
 var (
 	managedPartitionAnnotation  = "konsumerator.lwolf.org/partition"
 	disableAutoscalerAnnotation = "konsumerator.lwolf.org/disable-autoscaler"
-	deploymentGeneration        = "konsumerator.lwolf.org/deployment-generation"
-	deployOwnerKey              = ".metadata.controller"
+	generationKey               = "konsumerator.lwolf.org/generation"
+	ownerKey                    = ".metadata.controller"
 	defaultPartitionEnvKey      = "KONSUMERATOR_PARTITION"
 	gomaxprocsEnvKey            = "GOMAXPROCS"
 	defaultMinSyncPeriod        = time.Minute
@@ -74,8 +74,6 @@ type ConsumerReconciler struct {
 
 // +kubebuilder:rbac:groups=konsumerator.lwolf.org,resources=consumers,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=konsumerator.lwolf.org,resources=consumers/status,verbs=get;update;patch
-// +kubebuilder:rbac:groups=apps,resources=deployments,verbs=get;update;patch;delete;list
-// +kubebuilder:rbac:groups=apps,resources=deployments/status,verbs=get
 
 func (r *ConsumerReconciler) Reconcile(req ctrl.Request) (ctrl.Result, error) {
 	ctx := context.Background()
@@ -89,11 +87,11 @@ func (r *ConsumerReconciler) Reconcile(req ctrl.Request) (ctrl.Result, error) {
 		// on deleted requests.
 		return ctrl.Result{}, errors.IgnoreNotFound(err)
 	}
-	var managedDeploys v1.DeploymentList
-	if err := r.List(ctx, &managedDeploys, client.InNamespace(req.Namespace), client.MatchingField(deployOwnerKey, req.Name)); err != nil {
-		eMsg := "unable to list managed deployments"
+	var managedInstances v1.ReplicaSetList
+	if err := r.List(ctx, &managedInstances, client.InNamespace(req.Namespace), client.MatchingField(ownerKey, req.Name)); err != nil {
+		eMsg := "unable to list managed ReplicaSets"
 		log.Error(err, eMsg)
-		r.recorder.Event(&consumer, corev1.EventTypeWarning, "ListDeployFailure", eMsg)
+		r.recorder.Event(&consumer, corev1.EventTypeWarning, "ListReplicaSetFailure", eMsg)
 		return ctrl.Result{}, err
 	}
 	var err error
@@ -132,20 +130,20 @@ func (r *ConsumerReconciler) Reconcile(req ctrl.Request) (ctrl.Result, error) {
 	var observedIds []int32
 	var laggingIds []int32
 	var outdatedIds []int32
-	var redundantInstances []*appsv1.Deployment
-	var outdatedInstances []*appsv1.Deployment
+	var redundantInstances []*appsv1.ReplicaSet
+	var outdatedInstances []*appsv1.ReplicaSet
 
-	hash, err := hashstructure.Hash(consumer.Spec.DeploymentTemplate, nil)
+	hash, err := hashstructure.Hash(consumer.Spec.PodSpec, nil)
 	if err != nil {
 		return ctrl.Result{}, err
 	}
 	consumer.Status.ObservedGeneration = helpers.Ptr2Int64(int64(hash))
 
 	trackedPartitions := make(map[int32]bool)
-	for i := range managedDeploys.Items {
-		deploy := managedDeploys.Items[i].DeepCopy()
+	for i := range managedInstances.Items {
+		rs := managedInstances.Items[i].DeepCopy()
 		var isOutdated bool
-		partition := helpers.ParsePartitionAnnotation(deploy.Annotations[managedPartitionAnnotation])
+		partition := helpers.ParsePartitionAnnotation(rs.Annotations[managedPartitionAnnotation])
 		if partition == nil {
 			log.Error(nil, "failed to parse annotation with partition number. Panic!!!")
 			continue
@@ -153,25 +151,25 @@ func (r *ConsumerReconciler) Reconcile(req ctrl.Request) (ctrl.Result, error) {
 		trackedPartitions[*partition] = true
 		lag := mp.GetLagByPartition(*partition)
 		r.Log.Info("lag per partition", "partition", *partition, "lag", lag)
-		if deploy.Status.Replicas > 0 {
+		if rs.Status.Replicas > 0 {
 			observedIds = append(observedIds, *partition)
 		} else {
 			pausedIds = append(pausedIds, *partition)
 		}
 		if *partition >= *consumer.Spec.NumPartitions {
-			redundantInstances = append(redundantInstances, deploy)
+			redundantInstances = append(redundantInstances, rs)
 			continue
 		}
 		if consumer.Spec.Autoscaler.Prometheus.TolerableLag != nil && lag >= consumer.Spec.Autoscaler.Prometheus.TolerableLag.Duration {
 			isOutdated = true
 			laggingIds = append(laggingIds, *partition)
 		}
-		if deploy.Annotations[deploymentGeneration] != strconv.Itoa(int(*consumer.Status.ObservedGeneration)) {
+		if rs.Annotations[generationKey] != strconv.Itoa(int(*consumer.Status.ObservedGeneration)) {
 			isOutdated = true
 			outdatedIds = append(outdatedIds, *partition)
 		}
 		if isOutdated {
-			outdatedInstances = append(outdatedInstances, deploy)
+			outdatedInstances = append(outdatedInstances, rs)
 		}
 	}
 	for i := int32(0); i < *consumer.Spec.NumPartitions; i++ {
@@ -184,7 +182,7 @@ func (r *ConsumerReconciler) Reconcile(req ctrl.Request) (ctrl.Result, error) {
 	consumer.Status.Outdated = helpers.Ptr2Int32(int32(len(outdatedInstances)))
 	consumer.Status.Expected = consumer.Spec.NumPartitions
 	log.V(1).Info(
-		"deployments count",
+		"instances count",
 		"expected", consumer.Spec.NumPartitions,
 		"running", len(observedIds),
 		"paused", len(pausedIds),
@@ -201,33 +199,33 @@ func (r *ConsumerReconciler) Reconcile(req ctrl.Request) (ctrl.Result, error) {
 	}
 
 	for _, part := range missingIds {
-		d, err := r.constructDeployment(consumer, part, mp)
+		d, err := r.constructReplicaSet(consumer, part, mp)
 		if err != nil {
-			log.Error(err, "failed to construct deployment from template")
+			log.Error(err, "failed to construct replicaSet from template")
 			continue
 		}
 		if err := r.Create(ctx, d); errors.IgnoreAlreadyExists(err) != nil {
-			log.Error(err, "unable to create new Deployment", "deployment", d, "partition", part)
+			log.Error(err, "unable to create new ReplicaSet", "replicaSet", d, "partition", part)
 			continue
 		}
-		log.V(1).Info("created new deployment", "deployment", d, "partition", part)
+		log.V(1).Info("created new replicaSet", "replicaSet", d, "partition", part)
 		r.recorder.Eventf(
 			&consumer,
 			corev1.EventTypeNormal,
-			"DeployCreate",
-			"deployment for partition was created %d", part,
+			"ReplicaSetCreate",
+			"replicaSet for partition was created %d", part,
 		)
 	}
 
 	for _, deploy := range redundantInstances {
 		if err := r.Delete(ctx, deploy); errors.IgnoreNotFound(err) != nil {
-			log.Error(err, "unable to delete deployment", "deployment", deploy)
+			log.Error(err, "unable to delete replicaSet", "replicaSet", deploy)
 		}
 		r.recorder.Eventf(
 			&consumer,
 			corev1.EventTypeNormal,
-			"DeployDelete",
-			"deployment %s was deleted", deploy.Name,
+			"ReplicaSetDelete",
+			"replicaSet %s was deleted", deploy.Name,
 		)
 	}
 
@@ -238,49 +236,61 @@ func (r *ConsumerReconciler) Reconcile(req ctrl.Request) (ctrl.Result, error) {
 		partitionKey = defaultPartitionEnvKey
 	}
 
-	for _, deploy := range outdatedInstances {
-		deploy.Annotations[deploymentGeneration] = strconv.Itoa(int(*consumer.Status.ObservedGeneration))
-		deploy.Spec = consumer.Spec.DeploymentTemplate
-		partition := helpers.ParsePartitionAnnotation(deploy.Annotations[managedPartitionAnnotation])
+	for _, rs := range outdatedInstances {
+		labels := instanceLabels(consumer.Name)
+		rs.Annotations[generationKey] = strconv.Itoa(int(*consumer.Status.ObservedGeneration))
+		rs.Spec = appsv1.ReplicaSetSpec{
+			Replicas: helpers.Ptr2Int32(1),
+			Selector: &metav1.LabelSelector{
+				MatchLabels: labels,
+			},
+			Template: corev1.PodTemplateSpec{
+				ObjectMeta: metav1.ObjectMeta{
+					Labels: labels,
+				},
+				Spec: consumer.Spec.PodSpec,
+			},
+		}
+		partition := helpers.ParsePartitionAnnotation(rs.Annotations[managedPartitionAnnotation])
 		if partition == nil {
 			log.Error(nil, "failed to parse annotation with partition number.")
 			continue
 		}
-		for containerIndex := range deploy.Spec.Template.Spec.Containers {
-			name := deploy.Spec.Template.Spec.Containers[containerIndex].Name
+		for containerIndex := range rs.Spec.Template.Spec.Containers {
+			name := rs.Spec.Template.Spec.Containers[containerIndex].Name
 			// TODO: do not call predictors at all if providers.DummyMP is used
 			// TODO: make predictors configurable
 			predictor := predictors.NewNaivePredictor(log, mp, consumer.Spec.Autoscaler.Prometheus)
 			limits := predictors.GetResourcePolicy(name, &consumer.Spec)
 			resources := predictor.Estimate(name, limits, *partition)
-			deploy.Spec.Template.Spec.Containers[containerIndex].Resources = *resources
-			envs := deploy.Spec.Template.Spec.Containers[containerIndex].Env
+			rs.Spec.Template.Spec.Containers[containerIndex].Resources = *resources
+			envs := rs.Spec.Template.Spec.Containers[containerIndex].Env
 			envs = setEnvVariable(envs, partitionKey, strconv.Itoa(int(*partition)))
 			envs = setEnvVariable(envs, gomaxprocsEnvKey, goMaxProcsFromResource(resources.Limits.Cpu()))
-			deploy.Spec.Template.Spec.Containers[containerIndex].Env = envs
+			rs.Spec.Template.Spec.Containers[containerIndex].Env = envs
 			r.recorder.Eventf(
 				&consumer,
 				corev1.EventTypeNormal,
-				"DeployUpdate",
-				"deployment=%s, container=%s, CpuReq=%d, CpuLimit=%d",
-				deploy.Name, name, resources.Requests.Cpu().MilliValue(), resources.Limits.Cpu().MilliValue(),
+				"ReplicaSetUpdate",
+				"replicaSet=%s, container=%s, CpuReq=%d, CpuLimit=%d",
+				rs.Name, name, resources.Requests.Cpu().MilliValue(), resources.Limits.Cpu().MilliValue(),
 			)
 		}
-		if err := r.Update(ctx, deploy); errors.IgnoreConflict(err) != nil {
-			log.Error(err, "unable to update deployment", "deployment", deploy)
+		if err := r.Update(ctx, rs); errors.IgnoreConflict(err) != nil {
+			log.Error(err, "unable to update replicaSet", "replicaSet", rs)
 			r.recorder.Eventf(
 				&consumer,
 				corev1.EventTypeWarning,
-				"DeployUpdate",
-				"deployment %s: update failed", deploy.Name,
+				"ReplicaSetUpdate",
+				"replicaSet %s: update failed", rs.Name,
 			)
 			continue
 		}
 		r.recorder.Eventf(
 			&consumer,
 			corev1.EventTypeNormal,
-			"DeployUpdate",
-			"deployment %s: updated", deploy.Name,
+			"ReplicaSetUpdate",
+			"replicaSet %s: updated", rs.Name,
 		)
 
 	}
@@ -311,48 +321,69 @@ func setEnvVariable(envVars []corev1.EnvVar, key string, value string) []corev1.
 	return envs
 }
 
-func (r *ConsumerReconciler) constructDeployment(consumer konsumeratorv1alpha1.Consumer, partition int32, store providers.MetricsProvider) (*appsv1.Deployment, error) {
-	deployLabels := make(map[string]string)
-	deployAnnotations := make(map[string]string)
-	deploy := &appsv1.Deployment{
+func instanceLabels(consumerName string) map[string]string {
+	return map[string]string{
+		"app": consumerName,
+	}
+}
+
+func (r *ConsumerReconciler) constructReplicaSet(consumer konsumeratorv1alpha1.Consumer, partition int32, store providers.MetricsProvider) (*appsv1.ReplicaSet, error) {
+	labels := instanceLabels(consumer.Name)
+	annotations := map[string]string{
+		"prometheus.io/scrape": "true",
+		"prometheus.io/port":   "9000",
+	}
+	rs := &appsv1.ReplicaSet{
 		TypeMeta: metav1.TypeMeta{},
 		ObjectMeta: metav1.ObjectMeta{
-			Labels:      deployLabels,
-			Annotations: deployAnnotations,
+			Labels:      labels,
+			Annotations: annotations,
 			Name:        fmt.Sprintf("%s-%d", consumer.Spec.Name, partition),
 			Namespace:   consumer.Spec.Namespace,
 		},
-		Spec: consumer.Spec.DeploymentTemplate,
+		Spec: appsv1.ReplicaSetSpec{
+			Replicas: helpers.Ptr2Int32(1),
+			Selector: &metav1.LabelSelector{
+				MatchLabels: labels,
+			},
+			Template: corev1.PodTemplateSpec{
+				ObjectMeta: metav1.ObjectMeta{
+					Labels:      labels,
+					Annotations: annotations,
+				},
+				Spec: consumer.Spec.PodSpec,
+			},
+		},
 	}
-	deploy.Annotations[managedPartitionAnnotation] = strconv.Itoa(int(partition))
-	deploy.Annotations[deploymentGeneration] = strconv.Itoa(int(*consumer.Status.ObservedGeneration))
+	rs.Annotations[managedPartitionAnnotation] = strconv.Itoa(int(partition))
+	rs.Annotations[generationKey] = strconv.Itoa(int(*consumer.Status.ObservedGeneration))
 	var partitionKey string
 	if consumer.Spec.PartitionEnvKey != "" {
 		partitionKey = consumer.Spec.PartitionEnvKey
 	} else {
 		partitionKey = defaultPartitionEnvKey
 	}
-	for containerIndex := range deploy.Spec.Template.Spec.Containers {
-		name := deploy.Spec.Template.Spec.Containers[containerIndex].Name
+	for containerIndex := range rs.Spec.Template.Spec.Containers {
+		name := rs.Spec.Template.Spec.Containers[containerIndex].Name
 		predictor := predictors.NewNaivePredictor(r.Log, store, consumer.Spec.Autoscaler.Prometheus)
 		limits := predictors.GetResourcePolicy(name, &consumer.Spec)
 		resources := predictor.Estimate(name, limits, partition)
-		deploy.Spec.Template.Spec.Containers[containerIndex].Resources = *resources
-		envs := deploy.Spec.Template.Spec.Containers[containerIndex].Env
+		rs.Spec.Template.Spec.Containers[containerIndex].Resources = *resources
+		envs := rs.Spec.Template.Spec.Containers[containerIndex].Env
 		envs = setEnvVariable(envs, partitionKey, strconv.Itoa(int(partition)))
 		envs = setEnvVariable(envs, gomaxprocsEnvKey, goMaxProcsFromResource(resources.Limits.Cpu()))
-		deploy.Spec.Template.Spec.Containers[containerIndex].Env = envs
+		rs.Spec.Template.Spec.Containers[containerIndex].Env = envs
 	}
-	if err := ctrl.SetControllerReference(&consumer, deploy, r.Scheme); err != nil {
+	if err := ctrl.SetControllerReference(&consumer, rs, r.Scheme); err != nil {
 		return nil, err
 	}
-	return deploy, nil
+	return rs, nil
 }
 
 func (r *ConsumerReconciler) SetupWithManager(mgr ctrl.Manager) error {
-	if err := mgr.GetFieldIndexer().IndexField(&appsv1.Deployment{}, deployOwnerKey, func(rawObj runtime.Object) []string {
+	if err := mgr.GetFieldIndexer().IndexField(&appsv1.ReplicaSet{}, ownerKey, func(rawObj runtime.Object) []string {
 		// grab the object, extract the owner...
-		d := rawObj.(*appsv1.Deployment)
+		d := rawObj.(*appsv1.ReplicaSet)
 		owner := metav1.GetControllerOf(d)
 		if owner == nil {
 			return nil
@@ -367,6 +398,6 @@ func (r *ConsumerReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	r.recorder = mgr.GetEventRecorderFor("konsumerator")
 	return ctrl.NewControllerManagedBy(mgr).
 		For(&konsumeratorv1alpha1.Consumer{}).
-		Owns(&appsv1.Deployment{}).
+		Owns(&appsv1.ReplicaSet{}).
 		Complete(r)
 }

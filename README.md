@@ -40,7 +40,7 @@ spec:
       ramPerCore: "100M"
       # criticalLag is some value close to the SLO.
       # if lag has reached this point, autoscaler will
-      # give maximum allowed resource to that deployment
+      # give maximum allowed resource to that instance
       criticalLag: "60m"
       # preferable recovery time. During lag, Consumer will try to allocate 
       # as much resources as possible to recover from lag during this period
@@ -64,28 +64,21 @@ spec:
         query: "sum(rate(kafka_messages_consumed_total{topic=''}[5m])) by (partition)"
         partitionLabel: "partition"
   # partitionEnvKey - the name of the environment variable
-  # containing partition number the deployment is responsible for
+  # containing partition number the instance is responsible for
   partitionEnvKey: "PARTITION"
-  # DeploymentSpec to run the consumer
-  deploymentTemplate:
-    replicas: 1
-    strategy:
-      type: Recreate
-    selector:
-      matchLabels:
+  # PodSpec to run the consumer instances
+  podSpec:
+    metadata:
+      labels:
         app: my-dep
-    template:
-      metadata:
-        labels:
-          app: my-dep
-      spec:
-        containers:
-          - image: busybox
-            name: busybox-sidecar
-            command: ["/bin/sh", "-ec", "env && sleep 3000"]
-          - image: busybox
-            name: busybox
-            command: ["/bin/sh", "-ec", "sleep 2000"]
+    spec:
+      containers:
+        - image: busybox
+          name: busybox-sidecar
+          command: ["/bin/sh", "-ec", "env && sleep 3000"]
+        - image: busybox
+          name: busybox
+          command: ["/bin/sh", "-ec", "sleep 2000"]
   # resource boundaries, this policy protects
   # the consumer from scaling to 0 or infinity in case
   # of incidents

@@ -8,5 +8,5 @@ spec:
     spec:
       containers:
       # Change the value of image field below to your controller image URL
-      - image: quay.io/lwolf/konsumerator:latest
+      - image: quay.io/lwolf/konsumerator:35-702d76c
         name: manager

@@ -21,8 +21,8 @@ import (
 	. "github.com/onsi/ginkgo"
 	. "github.com/onsi/gomega"
 	"golang.org/x/net/context"
-	appsv1 "k8s.io/api/apps/v1"
 	"k8s.io/api/core/v1"
+	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 )
@@ -65,18 +65,10 @@ var _ = Describe("Consumer", func() {
 					NumPartitions: helpers.Ptr2Int32(1),
 					Name:          "foo",
 					Namespace:     "default",
-					DeploymentTemplate: appsv1.DeploymentSpec{
-						Replicas: helpers.Ptr2Int32(1),
-						Selector: &metav1.LabelSelector{MatchLabels: map[string]string{"key": "value"}, MatchExpressions: nil},
-						Template: v1.PodTemplateSpec{
-							ObjectMeta: metav1.ObjectMeta{
-								CreationTimestamp: metav1.Now(),
-							},
-							Spec: v1.PodSpec{
-								Containers: []v1.Container{
-									{Name: "pod", Image: "busybox"},
-								},
-							}},
+					PodSpec: corev1.PodSpec{
+						Containers: []v1.Container{
+							{Name: "pod", Image: "busybox"},
+						},
 					}, // spec.deploymentTemplate.template.metadata.creationTimestamp
 					ResourcePolicy: &autoscalev1.PodResourcePolicy{},
 				},
